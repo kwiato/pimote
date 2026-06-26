@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# Lokalna konfiguracja / sekrety — nigdy do repo
+config.env
+*.secret
+login.secret

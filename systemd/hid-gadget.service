@@ -1,0 +1,12 @@
+[Unit]
+Description=USB HID keyboard gadget
+After=sys-kernel-config.mount
+Requires=sys-kernel-config.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/hid-gadget.sh
+
+[Install]
+WantedBy=multi-user.target

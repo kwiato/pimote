@@ -1,0 +1,15 @@
+[Unit]
+Description=PC Remote Control Panel
+After=network-online.target hid-gadget.service
+Wants=network-online.target
+
+[Service]
+# __USER__ and __HOME__ are substituted by install.sh when it copies this file.
+User=__USER__
+WorkingDirectory=__HOME__/pc-remote
+EnvironmentFile=__HOME__/.config/pc-remote/config.env
+ExecStart=/usr/bin/python3 __HOME__/pc-remote/app.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

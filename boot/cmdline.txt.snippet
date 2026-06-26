@@ -1,0 +1,6 @@
+# /boot/firmware/cmdline.txt is a SINGLE line.
+# The dwc2 module is pulled in by the dtoverlay in config.txt anyway, so
+# modules-load is not required. If you do want to add it, insert "modules-load=dwc2"
+# right after "rootwait" — NOT at the end of the line, because the ds=nocloud
+# parameter (from the Imager) ends with a semicolon and breaks parsing of
+# anything after it.
