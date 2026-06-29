@@ -53,9 +53,14 @@ sudo reboot   # needed only the first time (activates the USB gadget)
 ```
 
 This downloads the repo and runs the interactive `install.sh` (asks for
-MAC/keyboard layout/password/port). Everything else — copying files,
-dependencies, the USB gadget, systemd services, config, and password — is done
-by the script.
+MAC/keyboard layout/panel password/port/Windows password). Everything else —
+copying files, dependencies, the USB gadget, systemd services, config, and
+secrets — is done by the script.
+
+> **The panel is password-protected.** On first run the installer makes you set
+> a **panel password**; the web UI is locked until you enter it. It also prints
+> an **API token** for automation (e.g. a Glance "Wake PC" tile). See
+> [Security](#security).
 
 ### Quick path (from a local clone)
 
@@ -125,9 +130,19 @@ echo -ne "\0\0\0\0\0\0\0\0"   | sudo tee /dev/hidg0 > /dev/null  # release
 
 ```bash
 sudo apt update
-sudo apt install -y python3-flask wakeonlan
+sudo apt install -y python3-flask python3-cryptography wakeonlan
 mkdir -p ~/pc-remote
 cp pc-remote/* ~/pc-remote/
+```
+
+Set the **panel password** and generate the **API token** (both stored in
+`~/.config/pc-remote`, chmod 600):
+
+```bash
+mkdir -p ~/.config/pc-remote && chmod 700 ~/.config/pc-remote
+PC_REMOTE_CFG_DIR=~/.config/pc-remote PANEL_PW='your-panel-password' \
+    python3 ~/pc-remote/crypto_secret.py set-panel
+PC_REMOTE_CFG_DIR=~/.config/pc-remote python3 ~/pc-remote/crypto_secret.py gen-token
 ```
 
 Configuration is kept **outside the code**, in `~/.config/pc-remote/config.env`
@@ -175,14 +190,21 @@ on the PC (tray → Preferences → "Run unattended") — then the tunnel comes 
 before login. The "🔑 Log in" button is a fallback in case that's not enough — the
 Pi (as a keyboard) raises the lock-screen curtain and types the password + Enter.
 
-The password is kept **outside the repo**, in an owner-read-only file:
+The password is kept **outside the repo** and **encrypted** with a key derived
+from your panel password (so the file on the SD card is useless without it):
+
 ```bash
-mkdir -p ~/.config/pc-remote
-printf '%s' 'YOUR_PASSWORD' > ~/.config/pc-remote/login.secret
-chmod 600 ~/.config/pc-remote/login.secret
+PC_REMOTE_CFG_DIR=~/.config/pc-remote \
+    PANEL_PW='your-panel-password' WIN_PW='YOUR_WINDOWS_PASSWORD' \
+    python3 ~/pc-remote/crypto_secret.py set-windows   # -> login.secret.enc
 ```
-You can override the path with the `PC_LOGIN_SECRET_FILE` env var (e.g. in
-`pc-remote.service`). Without this file the button returns a 400 and types nothing.
+
+Because the key comes from the panel password, the app caches it only while you
+are logged in: **after a service restart, unlock the panel once** before the
+"Log in" button can decrypt and type the password. You can override the file
+path with `PC_LOGIN_SECRET_FILE`. Without the file the button returns a 400 and
+types nothing. (Changing the panel password later requires re-running this so
+the Windows password is re-encrypted with the new key.)
 
 > ⚠️ With `KEYBOARD_LAYOUT=pl` the script assumes the **Polish "Programmers"**
 > layout on the Windows side (base ASCII = like US, Polish chars via AltGr). The
@@ -215,6 +237,42 @@ what matters is the layout Windows thinks is active.
 Works from S3 and S5. Avoid hibernation (S4). The Pi is powered separately from
 the wall, so it stays up 24/7 regardless of the PC's state — the panel is always
 reachable.
+
+## Security
+
+This panel can run arbitrary commands and type your password on the PC, so
+access is gated:
+
+- **Panel password** — the web UI is locked until you enter it. It is stored as
+  a one-way **scrypt hash** (`panel.secret`), never in clear text. A login is
+  cached in memory for 12 h; a service restart logs everyone out.
+- **API token** — a long random token (`api.token`) for automation. Send it as
+  `Authorization: Bearer <token>` (or `?token=`). It can drive every action
+  **except** "Log in" (typing the Windows password), which needs an interactive
+  panel login.
+- **Windows password** — stored **encrypted** (`login.secret.enc`) with a key
+  derived from the panel password; the key is never written to disk.
+- **Cookies** — `HttpOnly` + `SameSite=Strict` (blocks cross-site/CSRF POSTs).
+- **HID device** — `/dev/hidg0` is owned by the panel user, `chmod 600` (not
+  world-writable).
+
+Because of all this, binding to `0.0.0.0` is acceptable — but keeping the panel
+reachable only over **Tailscale** (not your LAN/Wi-Fi) is still recommended. The
+panel runs over plain HTTP; over Tailscale that traffic is encrypted by
+WireGuard anyway, but on a local LAN it is not.
+
+### Glance "Wake PC" tile
+
+Use the API token from the installer. Example `glance.yml` widget:
+
+```yaml
+- type: custom-api
+  title: Wake PC
+  url: http://<tailscale-ip>:5000/wake
+  method: POST
+  headers:
+    Authorization: Bearer <your-api-token>
+```
 
 ## Troubleshooting
 

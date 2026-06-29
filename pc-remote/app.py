@@ -2,16 +2,50 @@
 import os
 import glob
 import time
+import secrets
 import subprocess
+from functools import wraps
 from collections import deque
-from flask import Flask, request, jsonify, render_template_string
+from flask import (Flask, request, jsonify, session, redirect,
+                   render_template_string)
 import hid_keyboard as hid
+import crypto_secret as cs
 
 # Config comes from environment variables (the .env file loaded via systemd
 # EnvironmentFile) so the repo can be shared without editing source.
 PC_MAC = os.environ.get("PC_MAC", "")          # PC NIC MAC — used for WoL
 HOST = os.environ.get("REMOTE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("REMOTE_PORT", "5000"))
+
+CFG_DIR = os.environ.get(
+    "PC_REMOTE_CFG_DIR", os.path.expanduser("~/.config/pc-remote"))
+# Windows login password, encrypted with a key derived from the PANEL password
+# (see crypto_secret.py). Override the path with PC_LOGIN_SECRET_FILE.
+WIN_SECRET_FILE = os.environ.get(
+    "PC_LOGIN_SECRET_FILE", os.path.join(CFG_DIR, "login.secret.enc"))
+PANEL_HASH_FILE = os.path.join(CFG_DIR, "panel.secret")
+API_TOKEN_FILE = os.path.join(CFG_DIR, "api.token")
+
+# How long a panel login stays valid. The panel password is cached in memory
+# for this long so the "Log in" button can decrypt the Windows password.
+SESSION_TTL = 12 * 3600
+
+
+def _read(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+PANEL_HASH = _read(PANEL_HASH_FILE)   # scrypt hash; None = panel not configured
+API_TOKEN = _read(API_TOKEN_FILE)     # bearer token for automation; may be None
+
+# --- in-memory session store -------------------------------------------------
+# sid -> {"pw": <panel password>, "exp": <unix ts>}. Cleared on restart, so a
+# restart logs everyone out (and the cached panel passwords vanish with it).
+SESSIONS = {}
 
 # --- action log (in memory, dropped after 24h) ---
 LOG = deque()           # entries: {t, ts, action, level, detail}
@@ -58,23 +92,77 @@ def run_action(action, fn, detail=""):
     entry = log_event(action, level, f"usb={state}" + (f" {detail}" if detail else ""))
     return jsonify(ok=True, usb=state, entry=entry)
 
-# The Windows login password is kept OUTSIDE the repo, in a 600 file.
-# Override the path with the PC_LOGIN_SECRET_FILE env var if needed.
-SECRET_FILE = os.environ.get(
-    "PC_LOGIN_SECRET_FILE",
-    os.path.expanduser("~/.config/pc-remote/login.secret"),
+app = Flask(__name__)
+# Random per-process key: signs the session cookie. Regenerated every restart,
+# which (together with the in-memory SESSIONS store) means a restart logs out.
+app.secret_key = secrets.token_bytes(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",   # blocks cross-site (CSRF) POSTs
 )
 
-def load_password():
-    """Return the password from the file (without the trailing \\n), or None
-    when the file is missing."""
-    try:
-        with open(SECRET_FILE, "r", encoding="utf-8") as f:
-            return f.read().rstrip("\n")
-    except FileNotFoundError:
-        return None
+# --- authentication ----------------------------------------------------------
 
-app = Flask(__name__)
+def current_session():
+    """Return the live session dict (with the cached panel password) or None."""
+    sid = session.get("sid")
+    s = SESSIONS.get(sid) if sid else None
+    if s and s["exp"] > time.time():
+        return s
+    if sid:
+        SESSIONS.pop(sid, None)
+        session.pop("sid", None)
+    return None
+
+def _bearer_token():
+    h = request.headers.get("Authorization", "")
+    if h.startswith("Bearer "):
+        return h[7:].strip()
+    return request.args.get("token")   # also allow ?token= for simple links
+
+def is_authed():
+    """True for a logged-in browser session OR a valid API token."""
+    if current_session():
+        return True
+    tok = _bearer_token()
+    return bool(API_TOKEN and tok and secrets.compare_digest(tok, API_TOKEN))
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        if is_authed():
+            return fn(*a, **kw)
+        return jsonify(ok=False, error="unauthorized"), 401
+    return wrapper
+
+LOGIN_PAGE = """
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PC Remote — unlock</title>
+<style>
+ :root{color-scheme:dark}
+ body{font-family:system-ui,sans-serif;background:#15171c;color:#e7e9ee;
+      margin:0;display:grid;place-items:center;height:100vh}
+ form{max-width:320px;width:90%;text-align:center}
+ h1{font-size:1.2rem;margin-bottom:1rem}
+ input{width:100%;box-sizing:border-box;padding:14px;font-size:1rem;
+       border-radius:12px;border:1px solid #333;background:#1c1f26;
+       color:#e7e9ee;margin-bottom:10px}
+ button{width:100%;font-size:1rem;padding:14px;border:0;border-radius:12px;
+        background:#2a2e38;color:#e7e9ee;cursor:pointer}
+ .err{color:#e96b6b;font-size:.85rem;min-height:1.2em;margin-bottom:6px}
+ .note{color:#8b909c;font-size:.8rem;margin-top:1rem}
+</style></head><body>
+<form method="post" action="/auth">
+ <h1>🔒 PC Remote</h1>
+ <div class="err">{{ error }}</div>
+ <input type="password" name="password" placeholder="Panel password" autofocus>
+ <button>Unlock</button>
+ {% if not configured %}
+ <div class="note">No panel password set — run ./install.sh on the Pi.</div>
+ {% endif %}
+</form></body></html>
+"""
 
 PAGE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -100,6 +188,7 @@ PAGE = """
         background:#2a2e38;padding:10px 18px;border-radius:10px;opacity:0;
         transition:.2s}
  .row{display:flex;align-items:center;gap:8px}
+ .top{display:flex;justify-content:space-between;align-items:center}
  .link{font-size:.75rem;color:#8b909c;background:none;padding:0;width:auto;
        text-transform:none;letter-spacing:0;cursor:pointer}
  #log{margin-top:.4rem;font:.78rem/1.45 ui-monospace,SFMono-Regular,monospace;
@@ -110,7 +199,8 @@ PAGE = """
  #log .e:last-child{border-bottom:0}
  .lv-ok{color:#7fd99a}.lv-warn{color:#e7c15d}.lv-error{color:#e96b6b}
 </style></head><body>
-<h1>🖥️ PC Remote</h1>
+<div class="top"><h1>🖥️ PC Remote</h1>
+ <button class="link" onclick="logout()">log out</button></div>
 
 <h2>Power</h2>
 <div class="grid">
@@ -151,13 +241,16 @@ function addEntry(e){let d=document.getElementById('log');
  let row=document.createElement('div');row.className='e lv-'+e.level;
  row.textContent=e.ts+'  '+e.action+'  ['+e.level+']'+(e.detail?'  '+e.detail:'');
  d.append(row);d.scrollTop=d.scrollHeight}
-async function loadLogs(){let r=await fetch('/logs');let j=await r.json();
+async function loadLogs(){let r=await fetch('/logs');
+ if(r.status==401){location.reload();return}
+ let j=await r.json();
  let d=document.getElementById('log');d.innerHTML='';
  (j.entries||[]).forEach(addEntry)}
 async function post(url,body){
  try{
   let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
    body:JSON.stringify(body||{})});
+  if(r.status==401){location.reload();return}
   let j=await r.json();
   if(j.entry)addEntry(j.entry);
   let lv=j.entry?j.entry.level:(j.ok?'ok':'error');
@@ -170,38 +263,67 @@ function typeit(){let v=document.getElementById('txt').value;
  if(v)post('/type',{text:v})}
 function confirmShutdown(){
  if(confirm('Really shut down the PC?'))post('/shutdown')}
+async function logout(){await fetch('/logout',{method:'POST'});location.reload()}
 window.addEventListener('load',loadLogs);
 </script></body></html>
 """
 
 @app.route("/")
 def index():
+    if not is_authed():
+        return render_template_string(
+            LOGIN_PAGE, error="", configured=bool(PANEL_HASH)), 401
     return render_template_string(PAGE)
 
+@app.route("/auth", methods=["POST"])
+def auth():
+    pw = request.form.get("password", "")
+    if not PANEL_HASH or not cs.verify_panel_password(pw, PANEL_HASH):
+        return render_template_string(
+            LOGIN_PAGE, error="Wrong password.",
+            configured=bool(PANEL_HASH)), 401
+    sid = secrets.token_urlsafe(32)
+    SESSIONS[sid] = {"pw": pw, "exp": time.time() + SESSION_TTL}
+    session["sid"] = sid
+    return redirect("/")
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    sid = session.pop("sid", None)
+    if sid:
+        SESSIONS.pop(sid, None)
+    return jsonify(ok=True)
+
 @app.route("/logs")
+@require_auth
 def logs():
     return jsonify(entries=list(LOG))
 
 @app.route("/key", methods=["POST"])
+@require_auth
 def key():
-    keys = request.json.get("keys", [])
+    keys = (request.get_json(silent=True) or {}).get("keys", [])
     return run_action("key " + "+".join(keys), lambda: hid.send_key(*keys))
 
 @app.route("/type", methods=["POST"])
+@require_auth
 def type_text():
-    text = request.json.get("text", "")
+    text = (request.get_json(silent=True) or {}).get("text", "")
     return run_action(f"type {len(text)} chars", lambda: hid.type_string(text))
 
 @app.route("/run", methods=["POST"])
+@require_auth
 def run_cmd():
-    cmd = request.json.get("cmd", "")
+    cmd = (request.get_json(silent=True) or {}).get("cmd", "")
     return run_action(f"run: {cmd}", lambda: hid.run_command(cmd))
 
 @app.route("/shutdown", methods=["POST"])
+@require_auth
 def shutdown():
     return run_action("shutdown", lambda: hid.run_command("shutdown /s /t 0"))
 
 @app.route("/wake", methods=["POST"])
+@require_auth
 def wake():
     # WoL doesn't go over USB — we don't check the HID state here
     if not PC_MAC:
@@ -216,11 +338,22 @@ def wake():
         return jsonify(ok=False, error=str(e), entry=entry), 500
 
 @app.route("/login", methods=["POST"])
+@require_auth
 def login():
-    pw = load_password()
-    if not pw:
-        entry = log_event("login", "error", f"missing password file: {SECRET_FILE}")
-        return jsonify(ok=False, error=f"missing password file: {SECRET_FILE}", entry=entry), 400
+    # Typing the Windows password needs the panel password to decrypt it, so
+    # this only works for an interactive browser session — not a token call.
+    sess = current_session()
+    if sess is None:
+        entry = log_event("login", "error", "needs interactive panel login (not a token)")
+        return jsonify(ok=False, error="this action requires logging in to the panel (not an API token)", entry=entry), 403
+    blob = _read(WIN_SECRET_FILE)
+    if not blob:
+        entry = log_event("login", "error", f"missing password file: {WIN_SECRET_FILE}")
+        return jsonify(ok=False, error=f"missing password file: {WIN_SECRET_FILE}", entry=entry), 400
+    pw = cs.decrypt_windows_password(sess["pw"], blob)
+    if pw is None:
+        entry = log_event("login", "error", "could not decrypt Windows password")
+        return jsonify(ok=False, error="could not decrypt the stored Windows password (re-run install.sh if you changed the panel password)", entry=entry), 500
     return run_action("login (type password)", lambda: hid.login(pw))
 
 if __name__ == "__main__":

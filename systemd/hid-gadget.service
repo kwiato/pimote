@@ -6,6 +6,9 @@ Requires=sys-kernel-config.mount
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# __USER__ is substituted by install.sh so the script can chown /dev/hidg0 to
+# the panel user (instead of leaving it world-writable).
+Environment=HID_OWNER=__USER__
 ExecStart=/usr/local/bin/hid-gadget.sh
 
 [Install]

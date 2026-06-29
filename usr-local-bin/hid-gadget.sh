@@ -30,5 +30,12 @@ ln -s functions/hid.usb0 configs/c.1/
 # bind the gadget to the USB controller
 ls /sys/class/udc > UDC
 
-# let the panel write without root
-chmod 666 /dev/hidg0
+# Let the panel write to the device without root, but DON'T make it
+# world-writable (0666 let any local user inject keystrokes into the PC).
+# install.sh passes the panel user via HID_OWNER so we can lock it down to 0600.
+if [ -n "${HID_OWNER:-}" ]; then
+    chown "$HID_OWNER" /dev/hidg0 && chmod 600 /dev/hidg0
+else
+    # Manual setup without HID_OWNER: at least drop "other" write access.
+    chmod 660 /dev/hidg0
+fi
